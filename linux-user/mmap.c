@@ -200,6 +200,27 @@ abi_ulong mmap_next_start = TASK_UNMAPPED_BASE;
 
 unsigned long last_brk;
 
+/*
+ * Highest guest address a mapping chosen by the host may end at.  The host
+ * can return an address anywhere in its 64-bit space when the hint is busy,
+ * and h2g_valid() accepts all of it for targets whose virtual address space
+ * is 64 bits wide even when the ABI's pointers are 32 bits (N32); h2g() then
+ * truncates the address to a different, unmapped one.  IRIX user space also
+ * ends at 2 GB: addresses with bit 31 set are kernel segments, so a mapping
+ * placed there faults on first access.
+ */
+#ifdef TARGET_ABI_IRIX
+# define MMAP_GUEST_MAX 0x7ffffffful
+#else
+# define MMAP_GUEST_MAX ((unsigned long)(abi_ulong)-1)
+#endif
+
+static inline bool mmap_h2g_valid(void *last)
+{
+    return h2g_valid(last) &&
+           (unsigned long)last - guest_base <= MMAP_GUEST_MAX;
+}
+
 /* Subroutine of mmap_find_vma, used when we have pre-allocated a chunk
    of guest address space.  */
 static abi_ulong mmap_find_vma_reserved(abi_ulong start, abi_ulong size)
@@ -245,6 +266,41 @@ static abi_ulong mmap_find_vma_reserved(abi_ulong start, abi_ulong size)
     }
 
     return addr;
+}
+
+/*
+ * The host placed a hinted mapping outside the guest's address range, which
+ * is what it does when the hinted range is busy.  Its next choices are
+ * outside the range as well, so probe upward from the hint ourselves (then
+ * from the bottom of memory up to the hint) for a range the host gives us
+ * exactly where we ask.  Return -1 if there is none.
+ */
+static abi_ulong mmap_find_vma_probe(abi_ulong start, abi_ulong size)
+{
+    abi_ulong low = mmap_min_addr > TARGET_PAGE_SIZE
+                    ? TARGET_PAGE_ALIGN(mmap_min_addr) : TARGET_PAGE_SIZE;
+    unsigned long first[2] = { start, low };
+    unsigned long last[2] = { MMAP_GUEST_MAX, start };
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        unsigned long addr;
+
+        for (addr = first[pass]; addr < last[pass] &&
+             last[pass] - addr >= size - 1; addr += size) {
+            void *ptr = mmap(g2h(addr), size, PROT_NONE,
+                             MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
+                             -1, 0);
+
+            if (ptr == g2h(addr)) {
+                return addr;
+            }
+            if (ptr != MAP_FAILED) {
+                munmap(ptr, size);
+            }
+        }
+    }
+    return (abi_ulong)-1;
 }
 
 /*
@@ -296,7 +352,7 @@ abi_ulong mmap_find_vma(abi_ulong start, abi_ulong size)
            This is used to modify the search algorithm below.  */
         repeat = (ptr == prev ? repeat + 1 : 0);
 
-        if (h2g_valid(ptr + size - 1)) {
+        if (mmap_h2g_valid(ptr + size - 1)) {
             addr = h2g(ptr);
 
             if ((addr & ~TARGET_PAGE_MASK) == 0) {
@@ -330,9 +386,9 @@ abi_ulong mmap_find_vma(abi_ulong start, abi_ulong size)
                 break;
             }
         } else {
-            /* Since the result the kernel gave didn't fit, start
-               again at low memory.  If any repetition, fail.  */
-            addr = (repeat ? -1 : 0);
+            /* The result the kernel gave doesn't fit the guest's range.  */
+            munmap(ptr, size);
+            return mmap_find_vma_probe(start, size);
         }
 
         /* Unmap and try again.  */
