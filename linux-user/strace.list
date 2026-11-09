@@ -1521,6 +1521,18 @@
 #ifdef TARGET_NR_syssgi
 { TARGET_NR_syssgi, "syssgi" , NULL, NULL, NULL },
 #endif
+#ifdef TARGET_NR_sysinfosgi
+{ TARGET_NR_sysinfosgi, "sysinfo" , NULL, NULL, NULL },
+#endif
+#ifdef TARGET_NR_utssyssgi
+{ TARGET_NR_utssyssgi, "utssys" , NULL, NULL, NULL },
+#endif
+#ifdef TARGET_NR_gethostid
+{ TARGET_NR_gethostid, "gethostid" , NULL, NULL, NULL },
+#endif
+#ifdef TARGET_NR_sginap
+{ TARGET_NR_sginap, "sginap" , NULL, NULL, NULL },
+#endif
 #ifdef TARGET_NR_sys_setaltroot
 { TARGET_NR_sys_setaltroot, "sys_setaltroot" , NULL, NULL, NULL },
 #endif
