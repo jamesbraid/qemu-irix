@@ -7982,6 +7982,24 @@ static int open_net_route(void *cpu_env, int fd)
 }
 #endif
 
+#ifdef TARGET_ABI_IRIX
+/*
+ * The SGI free-running cycle counter, as reported by syssgi(2)
+ * SGI_QUERY_CYCLECNTR and SGI_CYCLECNTR_SIZE.  SGI's machines differ in
+ * counter width (24, 32 or 64 bits); the emulation provides the 64-bit
+ * layout documented for the Challenge/Onyx family: the high word at the
+ * returned address and the low word at address+4, read through a mapping
+ * of /dev/mmem.  The "hardware address" is a fixed address chosen here
+ * (it is only ever used as an mmap offset on /dev/mmem) and deliberately not
+ * page aligned, since the man page says callers must cope with that.
+ * The counter runs in nanoseconds of the host's CLOCK_MONOTONIC, so the
+ * period reported to the guest is 1000 picoseconds per tick.
+ */
+#define IRIX_CC_BITS    64
+#define IRIX_CC_PERIOD_PS 1000
+#define IRIX_CC_PADDR   0x1f0000f8u
+#endif
+
 static int do_openat(void *cpu_env, int dirfd, const char *pathname, int flags, mode_t mode)
 {
     struct fake_open {
@@ -14564,6 +14582,16 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
                     }
                 }
             }
+            break;
+        case TARGET_NR_syssgi_query_cyclecntr:
+            /* arg2: unsigned int, receives the period in ps per tick */
+            if (put_user_u32(IRIX_CC_PERIOD_PS, arg2)) {
+                goto efault;
+            }
+            ret = IRIX_CC_PADDR;
+            break;
+        case TARGET_NR_syssgi_cyclecntr_size:
+            ret = IRIX_CC_BITS;
             break;
 	case TARGET_NR_syssgi_sysid:
         {
