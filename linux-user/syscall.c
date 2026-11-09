@@ -7989,15 +7989,156 @@ static int open_net_route(void *cpu_env, int fd)
  * counter width (24, 32 or 64 bits); the emulation provides the 64-bit
  * layout documented for the Challenge/Onyx family: the high word at the
  * returned address and the low word at address+4, read through a mapping
- * of /dev/mmem.  The "hardware address" is a fixed address chosen here
- * (it is only ever used as an mmap offset on /dev/mmem) and deliberately not
- * page aligned, since the man page says callers must cope with that.
+ * of /dev/mmem.  The address SGI_QUERY_CYCLECNTR returns is the one IRIX 6.5
+ * returns: RTC_MMAP_ADDR (0xaddac000, sys/mman.h) ORed with the counter's
+ * offset in its page.  It is a cookie, not a hardware address: the program
+ * rounds it down to a page and passes that as the mmap offset on /dev/mmem.
+ * The offset is deliberately not page aligned, since callers must cope with
+ * that.
  * The counter runs in nanoseconds of the host's CLOCK_MONOTONIC, so the
  * period reported to the guest is 1000 picoseconds per tick.
  */
 #define IRIX_CC_BITS    64
 #define IRIX_CC_PERIOD_PS 1000
-#define IRIX_CC_PADDR   0x1f0000f8u
+#define IRIX_RTC_MMAP_ADDR 0xaddac000u   /* sys/mman.h RTC_MMAP_ADDR */
+#define IRIX_CC_PADDR   (IRIX_RTC_MMAP_ADDR | 0xf8u)
+#define IRIX_CC_PAGE    (IRIX_CC_PADDR & ~0xfffu)
+#define IRIX_CC_PAGE_SIZE 0x4000u /* covers a 16 KB IRIX page too */
+
+/*
+ * /dev/mmem is a window on physical memory.  The only physical address the
+ * emulation implements is the cycle counter's page, so opening it hands out
+ * a read-only descriptor for a 16 KB memfd (the largest IRIX page, so a
+ * POFFMASK-sized mapping works for either page size; everything but the
+ * counter word reads as zero), and mmap() of that
+ * descriptor at the counter's page maps that memfd.  A helper thread keeps
+ * the counter word in the page current; the guest reads it with plain loads.
+ * Its refresh interval is the host timer's wake-up latency (measured
+ * around 5 microseconds), coarser than the 1 ns period reported to the
+ * guest.  The updater thread is not recreated in a forked child, which
+ * shares the parent's page and so only sees it advance while the parent
+ * is alive.  Other offsets are not backed by
+ * anything and are refused.
+ */
+static pthread_mutex_t irix_mmem_lock = PTHREAD_MUTEX_INITIALIZER;
+static int irix_mmem_fd = -1;
+static struct stat irix_mmem_st;
+
+static void *irix_cc_thread(void *opaque)
+{
+    uint64_t *word = opaque;
+    sigset_t all;
+
+    /* guest signals must never be delivered here */
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
+    prctl(PR_SET_TIMERSLACK, 1);
+
+    for (;;) {
+        struct timespec ts;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        /* one 64-bit store, so the guest's two 32-bit loads see one value */
+        atomic_set(word, tswap64((uint64_t)ts.tv_sec * 1000000000ull +
+                                 ts.tv_nsec));
+        ts.tv_sec = 0;
+        ts.tv_nsec = 1000;
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+/* Create the counter page and its updater on first use; 0 or -1/errno. */
+static int irix_mmem_init(void)
+{
+#ifdef __NR_memfd_create
+    int fd, hi;
+    void *page;
+    pthread_t thr;
+
+    pthread_mutex_lock(&irix_mmem_lock);
+    if (irix_mmem_fd >= 0) {
+        pthread_mutex_unlock(&irix_mmem_lock);
+        return 0;
+    }
+    fd = syscall(__NR_memfd_create, "irix-mmem", 1u /* MFD_CLOEXEC */);
+    if (fd < 0 || ftruncate(fd, IRIX_CC_PAGE_SIZE) < 0 ||
+        (page = mmap(NULL, IRIX_CC_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, 0)) == MAP_FAILED) {
+        int e = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        pthread_mutex_unlock(&irix_mmem_lock);
+        errno = e;
+        return -1;
+    }
+    /* keep the descriptor out of the range a guest allocates from */
+    hi = fcntl(fd, F_DUPFD_CLOEXEC, 1000);
+    if (hi >= 0) {
+        close(fd);
+        fd = hi;
+    }
+    if (pthread_create(&thr, NULL, irix_cc_thread,
+                       (char *)page + (IRIX_CC_PADDR & 0xfff)) != 0) {
+        close(fd);
+        pthread_mutex_unlock(&irix_mmem_lock);
+        errno = EAGAIN;
+        return -1;
+    }
+    pthread_detach(thr);
+    fstat(fd, &irix_mmem_st);
+    irix_mmem_fd = fd;
+    pthread_mutex_unlock(&irix_mmem_lock);
+    return 0;
+#else
+    errno = ENODEV;
+    return -1;
+#endif
+}
+
+/* open("/dev/mmem"): only read-only access is provided */
+static int irix_open_mmem(int flags)
+{
+    char name[40];
+
+    if ((flags & O_ACCMODE) != O_RDONLY) {
+        errno = EACCES;
+        return -1;
+    }
+    if (irix_mmem_init() < 0) {
+        return -1;
+    }
+    snprintf(name, sizeof(name), "/proc/self/fd/%d", irix_mmem_fd);
+    return open(name, O_RDONLY);
+}
+
+static bool irix_fd_is_mmem(int fd)
+{
+    struct stat st;
+
+    return irix_mmem_fd >= 0 && fstat(fd, &st) == 0 &&
+           st.st_dev == irix_mmem_st.st_dev && st.st_ino == irix_mmem_st.st_ino;
+}
+
+/* mmap() for IRIX guests: file offsets on /dev/mmem are physical addresses */
+static abi_long irix_target_mmap(abi_ulong start, abi_ulong len, int prot,
+                                 int flags, int fd, off64_t off)
+{
+    if (fd >= 0 && irix_fd_is_mmem(fd)) {
+        /* a 32-bit ABI sign-extends an offset with bit 31 set */
+        if ((uint32_t)off != IRIX_CC_PAGE || len == 0 || len > IRIX_CC_PAGE_SIZE) {
+            errno = ENXIO;
+            return -1;
+        }
+        if (prot & PROT_WRITE) {
+            errno = EACCES;
+            return -1;
+        }
+        off = 0;
+    }
+    return target_mmap(start, len, prot, flags, fd, off);
+}
 #endif
 
 static int do_openat(void *cpu_env, int dirfd, const char *pathname, int flags, mode_t mode)
@@ -8018,6 +8159,12 @@ static int do_openat(void *cpu_env, int dirfd, const char *pathname, int flags, 
 #endif
         { NULL, NULL, NULL }
     };
+
+#ifdef TARGET_ABI_IRIX
+    if (!strcmp(pathname, "/dev/mmem")) {
+        return irix_open_mmem(flags);
+    }
+#endif
 
     if (is_proc_myself(pathname, "exe")) {
         int execfd = qemu_getauxval(AT_EXECFD);
@@ -10084,9 +10231,15 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
                 arg5 >= 0 && fstat(arg5, &st) >= 0 && st.st_size < arg6+arg2)
             ret = get_errno(ftruncate(arg5, arg6+arg2));
 #endif
+#ifdef TARGET_ABI_IRIX
+        ret = get_errno(irix_target_mmap(arg1, arg2, arg3,
+                                    target_to_host_bitmask(arg4, mmap_flags_tbl),
+                                    arg5, arg6));
+#else
         ret = get_errno(target_mmap(arg1, arg2, arg3,
                                     target_to_host_bitmask(arg4, mmap_flags_tbl),
                                     arg5, arg6));
+#endif
 #endif
         break;
 #endif
@@ -10106,9 +10259,15 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
                     arg5 >= 0 && fstat(arg5, &st) >= 0 && st.st_size < off+arg2)
                 ret = get_errno(ftruncate64(arg5, off+arg2));
 #endif
+#ifdef TARGET_ABI_IRIX
+            ret = get_errno(irix_target_mmap(arg1, arg2, arg3,
+                                    target_to_host_bitmask(arg4, mmap_flags_tbl),
+                                    arg5, off));
+#else
             ret = get_errno(target_mmap(arg1, arg2, arg3,
                                     target_to_host_bitmask(arg4, mmap_flags_tbl),
                                     arg5, off));
+#endif
         }
         break;
 #endif
