@@ -191,21 +191,103 @@ void init_paths(const char *prefix_list)
     g_free(list);
 }
 
+/* Join DIR and LEAF into one of a few per-thread buffers, so that a
+   syscall translating two names (rename, link) can hold both results. */
+static const char *join_path(const char *dir, const char *leaf)
+{
+    static __thread char bufs[8][PATH_MAX];
+    static __thread unsigned next;
+    char *buf = bufs[next++ % 8];
+
+    if (snprintf(buf, PATH_MAX, "%s/%s", dir, leaf) >= PATH_MAX) {
+        return NULL;
+    }
+    return buf;
+}
+
+/* Split NAME into its directory part (copied into DIR) and last component.
+   Fails for names with no usable last component. */
+static const char *split_path(const char *name, char *dir, size_t dirlen)
+{
+    const char *leaf = strrchr(name, '/');
+    size_t n;
+
+    if (!leaf || !leaf[1] || strcmp(leaf + 1, ".") == 0 ||
+        strcmp(leaf + 1, "..") == 0) {
+        return NULL;
+    }
+    n = leaf - name ? leaf - name : 1;
+    if (n >= dirlen) {
+        return NULL;
+    }
+    memcpy(dir, name, n);
+    dir[n] = '\0';
+    return leaf + 1;
+}
+
+/* Find NAME in the emulation dirs.  The tree above is read once, so a file
+   created after start-up is missing from it; accept it when its directory
+   is in the sysroot and the file is really there. */
+static const char *lookup_path(const char *name)
+{
+    char dir[PATH_MAX];
+    const char *leaf, *pdir, *cand;
+    struct stat st;
+    int i;
+
+    for (i = 0; i < base_count; i++) {
+        const char *p = follow_path(base[i], name);
+        if (p) {
+            return p;
+        }
+    }
+
+    leaf = split_path(name, dir, sizeof(dir));
+    if (!leaf || !(pdir = lookup_path(dir))) {
+        return NULL;
+    }
+    cand = join_path(pdir, leaf);
+    if (cand && lstat(cand, &st) == 0) {
+        return cand;
+    }
+    return NULL;
+}
+
 /* Look for path in emulation dir, otherwise return name. */
 const char *path(const char *name)
 {
     const char *p;
-    int i;
 
     /* Only do absolute paths: quick and dirty, but should mostly be OK.
        Could do relative by tracking cwd. */
     if (!base || !name || name[0] != '/')
         return name;
 
-    for (i = 0; i < base_count; i++) {
-        if ((p = follow_path(base[i], name)))
-            return p;
-    }
+    p = lookup_path(name);
+    return p ? p : name;
+}
 
+/* Like path(), for a name about to be created: when it does not exist but
+   its directory is in the emulation dir, return the name inside that
+   directory, so the new file lands where later path() calls look. */
+const char *path_create(const char *name)
+{
+    char dir[PATH_MAX];
+    const char *p, *leaf, *pdir;
+
+    if (!base || !name || name[0] != '/')
+        return name;
+
+    p = lookup_path(name);
+    if (p) {
+        return p;
+    }
+    leaf = split_path(name, dir, sizeof(dir));
+    if (leaf && (pdir = lookup_path(dir))) {
+        p = join_path(pdir, leaf);
+        if (p) {
+            return p;
+        }
+    }
     return name;
 }

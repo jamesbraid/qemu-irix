@@ -8204,7 +8204,7 @@ static int do_openat(void *cpu_env, int dirfd, const char *pathname, int flags, 
         return fd;
     }
 
-    return safe_openat(dirfd, path(pathname), flags, mode);
+    return safe_openat(dirfd, (flags & O_CREAT) ? path_create(pathname) : path(pathname), flags, mode);
 }
 
 #define TIMER_MAGIC 0x0caf0000
@@ -8656,7 +8656,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_creat:
         if (!(p = lock_user_string(arg1)))
             goto efault;
-        ret = get_errno(creat(p, arg2));
+        ret = get_errno(creat(path_create(p), arg2));
         fd_trans_unregister(ret);
         unlock_user(p, arg1, 0);
         break;
@@ -8665,7 +8665,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_creat64:
         if (!(p = lock_user_string(arg1)))
             goto efault;
-        ret = get_errno(open(path(p), O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, arg2));
+        ret = get_errno(open(path_create(p), O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, arg2));
         fd_trans_unregister(ret);
         unlock_user(p, arg1, 0);
         break;
@@ -8679,7 +8679,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p || !p2)
                 ret = -TARGET_EFAULT;
             else
-                ret = get_errno(link(path(p), path(p2)));
+                ret = get_errno(link(path(p), path_create(p2)));
             unlock_user(p2, arg2, 0);
             unlock_user(p, arg1, 0);
         }
@@ -8843,7 +8843,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_xmknod:
         if (!(p = lock_user_string(arg2)))
             goto efault;
-        ret = get_errno(mknod(path(p), arg3, arg4));
+        ret = get_errno(mknod(path_create(p), arg3, arg4));
         unlock_user(p, arg2, 0);
         break;
 #endif
@@ -8851,7 +8851,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_mknod:
         if (!(p = lock_user_string(arg1)))
             goto efault;
-        ret = get_errno(mknod(path(p), arg2, arg3));
+        ret = get_errno(mknod(path_create(p), arg2, arg3));
         unlock_user(p, arg1, 0);
         break;
 #endif
@@ -8859,7 +8859,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_mknodat:
         if (!(p = lock_user_string(arg2)))
             goto efault;
-        ret = get_errno(mknodat(arg1, path(p), arg3, arg4));
+        ret = get_errno(mknodat(arg1, path_create(p), arg3, arg4));
         unlock_user(p, arg2, 0);
         break;
 #endif
@@ -9152,7 +9152,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p || !p2)
                 ret = -TARGET_EFAULT;
             else
-                ret = get_errno(rename(path(p), path(p2)));
+                ret = get_errno(rename(path(p), path_create(p2)));
             unlock_user(p2, arg2, 0);
             unlock_user(p, arg1, 0);
         }
@@ -9167,7 +9167,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p || !p2)
                 ret = -TARGET_EFAULT;
             else
-                ret = get_errno(renameat(arg1, path(p), arg3, path(p2)));
+                ret = get_errno(renameat(arg1, path(p), arg3, path_create(p2)));
             unlock_user(p2, arg4, 0);
             unlock_user(p, arg2, 0);
         }
@@ -9182,7 +9182,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p || !p2) {
                 ret = -TARGET_EFAULT;
             } else {
-                ret = get_errno(sys_renameat2(arg1, path(p), arg3, path(p2), arg5));
+                ret = get_errno(sys_renameat2(arg1, path(p), arg3, path_create(p2), arg5));
             }
             unlock_user(p2, arg4, 0);
             unlock_user(p, arg2, 0);
@@ -9193,7 +9193,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_mkdir:
         if (!(p = lock_user_string(arg1)))
             goto efault;
-        ret = get_errno(mkdir(path(p), arg2));
+        ret = get_errno(mkdir(path_create(p), arg2));
         unlock_user(p, arg1, 0);
         break;
 #endif
@@ -9201,7 +9201,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_mkdirat:
         if (!(p = lock_user_string(arg2)))
             goto efault;
-        ret = get_errno(mkdirat(arg1, path(p), arg3));
+        ret = get_errno(mkdirat(arg1, path_create(p), arg3));
         unlock_user(p, arg2, 0);
         break;
 #endif
@@ -10093,7 +10093,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p || !p2)
                 ret = -TARGET_EFAULT;
             else
-                ret = get_errno(symlink(p, path(p2)));
+                ret = get_errno(symlink(p, path_create(p2)));
             unlock_user(p2, arg2, 0);
             unlock_user(p, arg1, 0);
         }
@@ -10108,7 +10108,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             if (!p || !p2)
                 ret = -TARGET_EFAULT;
             else
-                ret = get_errno(symlinkat(p, arg2, path(p2)));
+                ret = get_errno(symlinkat(p, arg2, path_create(p2)));
             unlock_user(p2, arg3, 0);
             unlock_user(p, arg1, 0);
         }

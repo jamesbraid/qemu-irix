@@ -3,5 +3,6 @@
 
 void init_paths(const char *prefix);
 const char *path(const char *pathname);
+const char *path_create(const char *pathname);
 
 #endif
