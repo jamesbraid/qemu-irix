@@ -3796,35 +3796,136 @@ struct target_sockaddr_raw {
     char sr_ifname[TARGET_RAW_IFNAMSIZ];
 };
 
-static abi_long irix_raw_addr(void *host_addr, abi_ulong target_addr,
-                              socklen_t len)
+/*
+ * The emulated machine has one network interface, named like the integral
+ * Ethernet of an Octane or O2.  An empty name in bind() selects it and is
+ * filled in with its name; any other name must match it.
+ */
+#define IRIX_RAW_IFNAME     "ec0"
+#define IRIX_RAW_MAXPORT    4   /* SNOOP_MAXPORT, net/raw.h */
+
+static bool irix_raw_ports[IRIX_RAW_MAXPORT + 1];   /* in use, by port */
+
+typedef struct IrixRawState {
+    bool bound;
+    int port;
+} IrixRawState;
+
+static IrixRawState *irix_raw_state;
+static unsigned int irix_raw_state_max;
+
+static IrixRawState *irix_raw_get(int fd)
+{
+    if (fd >= irix_raw_state_max) {
+        unsigned int old = irix_raw_state_max;
+
+        irix_raw_state_max = ((fd >> 6) + 1) << 6;
+        irix_raw_state = g_renew(IrixRawState, irix_raw_state,
+                                 irix_raw_state_max);
+        memset(irix_raw_state + old, 0,
+               (irix_raw_state_max - old) * sizeof(IrixRawState));
+    }
+    return &irix_raw_state[fd];
+}
+
+static TargetFdTrans irix_raw_trans;
+
+/* The socket's port is released with the descriptor. */
+static void irix_raw_close(int fd)
+{
+    if (fd >= 0 && fd < irix_raw_state_max && irix_raw_state[fd].bound) {
+        irix_raw_ports[irix_raw_state[fd].port] = false;
+        irix_raw_state[fd].bound = false;
+    }
+}
+
+/*
+ * bind() of a struct sockaddr_raw.  A name must be the interface's; an empty
+ * one binds the interface and has its name copied back.  Port 0 takes the
+ * lowest free snoop port.
+ */
+static abi_long irix_raw_bind(int fd, abi_ulong target_addr, socklen_t len)
 {
     struct target_sockaddr_raw *sr;
+    IrixRawState *st;
+    int port;
 
     if (len < sizeof(*sr)) {
         return -TARGET_EINVAL;
     }
-    sr = lock_user(VERIFY_READ, target_addr, sizeof(*sr), 1);
+    sr = lock_user(VERIFY_WRITE, target_addr, sizeof(*sr), 1);
     if (!sr) {
         return -TARGET_EFAULT;
     }
+    st = irix_raw_get(fd);
+    port = tswap16(sr->sr_port);
     if (tswap16(sr->sr_family) != TARGET_AF_RAW) {
         unlock_user(sr, target_addr, 0);
         return -TARGET_EAFNOSUPPORT;
     }
-    if (!memchr(sr->sr_ifname, 0, sizeof(sr->sr_ifname))) {
-        /* the interface name has no room for its terminator */
+    if (st->bound) {
         unlock_user(sr, target_addr, 0);
         return -TARGET_EINVAL;
     }
-    memset(host_addr, 0, sizeof(*sr));
-    unlock_user(sr, target_addr, 0);
+    if (sr->sr_ifname[0] &&
+        strncmp(sr->sr_ifname, IRIX_RAW_IFNAME, TARGET_RAW_IFNAMSIZ)) {
+        unlock_user(sr, target_addr, 0);
+        return -TARGET_EADDRNOTAVAIL;
+    }
+    if (port > IRIX_RAW_MAXPORT) {
+        unlock_user(sr, target_addr, 0);
+        return -TARGET_EADDRNOTAVAIL;
+    }
+    if (port == 0) {
+        for (port = 1; port <= IRIX_RAW_MAXPORT && irix_raw_ports[port];
+             port++) {
+        }
+        if (port > IRIX_RAW_MAXPORT) {
+            unlock_user(sr, target_addr, 0);
+            return -TARGET_EADDRINUSE;
+        }
+    } else if (irix_raw_ports[port]) {
+        unlock_user(sr, target_addr, 0);
+        return -TARGET_EADDRINUSE;
+    }
+    irix_raw_ports[port] = true;
+    st->bound = true;
+    st->port = port;
+    if (!sr->sr_ifname[0]) {
+        memset(sr->sr_ifname, 0, sizeof(sr->sr_ifname));
+        strcpy(sr->sr_ifname, IRIX_RAW_IFNAME);
+    }
+    unlock_user(sr, target_addr, sizeof(*sr));
     return 0;
 }
 
-static TargetFdTrans irix_raw_trans = {
-    .target_to_host_addr = irix_raw_addr,
-};
+/*
+ * SIOCGIFADDR on an AF_RAW socket: the interface named in ifr_name (bound
+ * or not) gets its link address back as a sockaddr_raw overlaying ifr_addr:
+ * the u_short family AF_RAW at ifreq byte 16, the six address bytes at byte
+ * 18 and zeros after.  The address is the configured one (QEMU_IRIXHOSTID)
+ * or else the host NIC rule's.
+ */
+static abi_long irix_raw_siocgifaddr(abi_ulong arg)
+{
+    uint8_t *ifr;
+    uint8_t mac[6];
+
+    ifr = lock_user(VERIFY_WRITE, arg, 32, 1);
+    if (!ifr) {
+        return -TARGET_EFAULT;
+    }
+    if (!memchr(ifr, 0, 16) || strcmp((char *)ifr, IRIX_RAW_IFNAME) ||
+        !irix_hostid_get_mac(mac)) {
+        unlock_user(ifr, arg, 0);
+        return -TARGET_EADDRNOTAVAIL;
+    }
+    memset(ifr + 16, 0, 16);
+    stw_be_p(ifr + 16, TARGET_AF_RAW);
+    memcpy(ifr + 18, mac, 6);
+    unlock_user(ifr, arg, 32);
+    return 0;
+}
 
 static bool irix_raw_fd(int fd)
 {
@@ -3944,16 +4045,16 @@ static abi_long do_bind(int sockfd, abi_ulong target_addr,
         return -TARGET_EINVAL;
     }
 
+    if (irix_raw_fd(sockfd)) {
+        return irix_raw_bind(sockfd, target_addr, addrlen);
+    }
+
     addr = alloca(addrlen+1);
 
     ret = target_to_host_sockaddr(sockfd, addr, target_addr, addrlen);
     if (ret)
         return ret;
 
-    if (irix_raw_fd(sockfd)) {
-        /* nothing to bind: the address was only checked */
-        return 0;
-    }
     return get_errno(bind(sockfd, addr, addrlen));
 }
 
@@ -5965,12 +6066,9 @@ static abi_long do_ioctl(int fd, int cmd, abi_long arg)
     void *argptr;
 
 #ifdef TARGET_ABI_IRIX
-    /*
-     * SIOCGIFADDR on an AF_RAW socket reads the NIC's Ethernet address.  The
-     * reply layout is not established yet, so refuse rather than guess.
-     */
-    if (cmd == TARGET_IRIX_SIOCGIFADDR && irix_raw_unsupported(fd, "SIOCGIFADDR")) {
-        return -TARGET_EOPNOTSUPP;
+    /* SIOCGIFADDR on an AF_RAW socket reads the NIC's Ethernet address */
+    if (cmd == TARGET_IRIX_SIOCGIFADDR && irix_raw_fd(fd)) {
+        return irix_raw_siocgifaddr(arg);
     }
 #endif
     ie = ioctl_entries;
@@ -9009,6 +9107,9 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
         break;
 #endif
     case TARGET_NR_close:
+#ifdef TARGET_ABI_IRIX
+        irix_raw_close(arg1);
+#endif
         fd_trans_unregister(arg1);
 #ifdef TARGET_ABI_IRIX
         /* TODO: is there something special for closing a negative fd in IRIX?
