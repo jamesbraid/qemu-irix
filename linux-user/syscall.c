@@ -8167,6 +8167,7 @@ static int open_net_route(void *cpu_env, int fd)
 #define IRIX_CC_PAGE    (IRIX_CC_PADDR & ~0xfffu)
 #define IRIX_CC_PAGE_SIZE 0x4000u /* covers a 16 KB IRIX page too */
 #define IRIX_FASTTIMER_PERIOD_NS 1000000
+#define IRIX_MODULE_INFO_SIZE 32   /* sizeof(module_info_t), sys/systeminfo.h */
 #define IRIX_NGROUPS_UMAX 32    /* sys/param.h */
 
 static int irix_cc_bits = 64;
@@ -15208,6 +15209,41 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
              * their own; assume the stock 1000 Hz fast clock.
              */
             ret = IRIX_FASTTIMER_PERIOD_NS;
+            break;
+        case TARGET_NR_syssgi_num_modules:
+            /* machines other than Origin 2000 class have one module */
+            ret = 1;
+            break;
+        case TARGET_NR_syssgi_module_info:
+            /*
+             * syssgi(SGI_MODULE_INFO, module, module_info_t *, size): only
+             * module 0 exists.  Fills { u64 serial_num; int mod_num;
+             * char serial_str[16]; } and copies out min(sizeof, size) bytes.
+             * The serial is the 32-bit one behind SI_HW_SERIAL (the low
+             * four bytes of the fixed 0x08006900000d), so the two agree;
+             * serial_str is "0800" and the serial as eight uppercase hex digits.
+             */
+            {
+                uint8_t mi[IRIX_MODULE_INFO_SIZE] = { 0 };
+                uint32_t serial = 0x6900000dU;
+                abi_ulong n = arg4 < sizeof(mi) ? arg4 : sizeof(mi);
+                void *dst;
+
+                if (arg2 != 0) {
+                    ret = -TARGET_EINVAL;
+                    break;
+                }
+                stq_be_p(mi, serial);
+                stl_be_p(mi + 8, 0);
+                snprintf((char *)mi + 12, 16, "0800%08X", serial);
+                dst = lock_user(VERIFY_WRITE, arg3, n, 0);
+                if (n && !dst) {
+                    goto efault;
+                }
+                memcpy(dst, mi, n);
+                unlock_user(dst, arg3, n);
+                ret = 0;
+            }
             break;
         case TARGET_NR_syssgi_cyclecntr_size:
             ret = irix_cc_bits;

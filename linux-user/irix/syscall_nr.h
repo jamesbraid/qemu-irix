@@ -268,6 +268,8 @@
 #define TARGET_NR_syssgi_getust		(130)
 #define TARGET_NR_syssgi_cyclecntr_size	(165)
 #define TARGET_NR_syssgi_query_fasttimer (166)
+#define TARGET_NR_syssgi_num_modules	(191)
+#define TARGET_NR_syssgi_module_info	(192)
 
 
 /* syssgi(sysconf, cmd, ...) */
