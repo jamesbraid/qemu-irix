@@ -15351,6 +15351,15 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     {
         char *target_buf;
 
+        /*
+         * Every reply below is built in a buffer of arg3-1 characters plus a
+         * terminator, so the count has to be positive before it is used.
+         * What a zero count means is not documented; refuse it.
+         */
+        if ((abi_long)arg3 <= 0) {
+            ret = -TARGET_EINVAL;
+            break;
+        }
         if (!(target_buf = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
             goto efault;
 
