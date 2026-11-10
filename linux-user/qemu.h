@@ -228,6 +228,7 @@ bool irix_hostid_get_mac(uint8_t mac[6]);
 /* QEMU_IRIXCYCLEBITS / -irixcyclebits: 24, 32 or 64 (default) */
 bool irix_cycle_bits_parse(const char *arg, int *bits);
 void irix_cycle_bits_set(int bits);
+void irix_cycle_counter_after_fork(void);
 #endif
 
 abi_long memcpy_to_target(abi_ulong dest, const void *src,

@@ -6755,6 +6755,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             ts = (TaskState *)cpu->opaque;
             task_settid(ts);
             fork_end(env, 1);
+#ifdef TARGET_ABI_IRIX
+            irix_cycle_counter_after_fork();
+#endif
             /* There is a race condition here.  The parent process could
                theoretically read the TID in the child process before the child
                tid is set.  This would require using either ptrace
@@ -8202,13 +8205,13 @@ static uint32_t irix_cc_period_ps(void)
  * the counter word in the page current; the guest reads it with plain loads.
  * Its refresh interval is the host timer's wake-up latency (measured
  * around 5 microseconds), coarser than the 1 ns period reported to the
- * guest.  The updater thread is not recreated in a forked child, which
- * shares the parent's page and so only sees it advance while the parent
- * is alive.  Other offsets are not backed by
+ * guest.  A forked child gets a page and updater of its own (see
+ * irix_cycle_counter_after_fork).  Other offsets are not backed by
  * anything and are refused.
  */
 static pthread_mutex_t irix_mmem_lock = PTHREAD_MUTEX_INITIALIZER;
 static int irix_mmem_fd = -1;
+static void *irix_mmem_page;
 static struct stat irix_mmem_st;
 
 /* Store the current counter value in the page, in the configured width. */
@@ -8250,19 +8253,16 @@ static void *irix_cc_thread(void *opaque)
     return NULL;
 }
 
-/* Create the counter page and its updater on first use; 0 or -1/errno. */
-static int irix_mmem_init(void)
+/*
+ * Make a counter page: a memfd holding the current counter value, mapped
+ * read-write for the updater.  Returns 0 or -1/errno.
+ */
+static int irix_mmem_make(int *fdp, void **pagep)
 {
 #ifdef __NR_memfd_create
     int fd, hi;
     void *page;
-    pthread_t thr;
 
-    pthread_mutex_lock(&irix_mmem_lock);
-    if (irix_mmem_fd >= 0) {
-        pthread_mutex_unlock(&irix_mmem_lock);
-        return 0;
-    }
     fd = syscall(__NR_memfd_create, "irix-mmem", 1u /* MFD_CLOEXEC */);
     if (fd < 0 || ftruncate(fd, IRIX_CC_PAGE_SIZE) < 0 ||
         (page = mmap(NULL, IRIX_CC_PAGE_SIZE, PROT_READ | PROT_WRITE,
@@ -8271,7 +8271,6 @@ static int irix_mmem_init(void)
         if (fd >= 0) {
             close(fd);
         }
-        pthread_mutex_unlock(&irix_mmem_lock);
         errno = e;
         return -1;
     }
@@ -8283,17 +8282,8 @@ static int irix_mmem_init(void)
     }
     /* a guest that reads right after mapping must not see a zero counter */
     irix_cc_update((char *)page + (IRIX_CC_PADDR & 0xfff));
-    if (pthread_create(&thr, NULL, irix_cc_thread,
-                       (char *)page + (IRIX_CC_PADDR & 0xfff)) != 0) {
-        close(fd);
-        pthread_mutex_unlock(&irix_mmem_lock);
-        errno = EAGAIN;
-        return -1;
-    }
-    pthread_detach(thr);
-    fstat(fd, &irix_mmem_st);
-    irix_mmem_fd = fd;
-    pthread_mutex_unlock(&irix_mmem_lock);
+    *fdp = fd;
+    *pagep = page;
     return 0;
 #else
     errno = ENODEV;
@@ -8301,7 +8291,130 @@ static int irix_mmem_init(void)
 #endif
 }
 
-/* open("/dev/mmem"): only read-only access is provided */
+static int irix_mmem_start_updater(void *page)
+{
+    pthread_t thr;
+
+    if (pthread_create(&thr, NULL, irix_cc_thread,
+                       (char *)page + (IRIX_CC_PADDR & 0xfff)) != 0) {
+        errno = EAGAIN;
+        return -1;
+    }
+    pthread_detach(thr);
+    return 0;
+}
+
+/* Create the counter page and its updater on first use; 0 or -1/errno. */
+static int irix_mmem_init(void)
+{
+    int fd;
+    void *page;
+
+    pthread_mutex_lock(&irix_mmem_lock);
+    if (irix_mmem_fd >= 0) {
+        pthread_mutex_unlock(&irix_mmem_lock);
+        return 0;
+    }
+    if (irix_mmem_make(&fd, &page) < 0) {
+        int e = errno;
+
+        pthread_mutex_unlock(&irix_mmem_lock);
+        errno = e;
+        return -1;
+    }
+    if (irix_mmem_start_updater(page) < 0) {
+        close(fd);
+        munmap(page, IRIX_CC_PAGE_SIZE);
+        pthread_mutex_unlock(&irix_mmem_lock);
+        errno = EAGAIN;
+        return -1;
+    }
+    fstat(fd, &irix_mmem_st);
+    irix_mmem_fd = fd;
+    irix_mmem_page = page;
+    pthread_mutex_unlock(&irix_mmem_lock);
+    return 0;
+}
+
+/*
+ * In a forked child the updater thread does not exist, and the page it
+ * would have kept current is the parent's, which only advances while the
+ * parent lives.  Give the child its own page and updater, then move every
+ * guest view of the old page over to the new one: each mapping of it, found
+ * through /proc/self/maps so partial unmaps and remaps are accounted for,
+ * is replaced in place, and each inherited /dev/mmem descriptor is repointed.
+ */
+void irix_cycle_counter_after_fork(void)
+{
+    int fd, dupfd, oldfd = irix_mmem_fd;
+    void *page;
+    struct stat oldst = irix_mmem_st;
+    FILE *fp;
+    char line[512];
+    DIR *dir;
+    struct dirent *de;
+    int fds[64], nfds = 0, i;
+
+    if (oldfd < 0) {
+        return;                 /* the parent never used the counter */
+    }
+    pthread_mutex_init(&irix_mmem_lock, NULL);
+    if (irix_mmem_make(&fd, &page) < 0 || irix_mmem_start_updater(page) < 0) {
+        return;                 /* keep sharing the parent's page */
+    }
+
+    fp = fopen("/proc/self/maps", "r");
+    if (fp) {
+        while (fgets(line, sizeof(line), fp)) {
+            unsigned long start, end, off, ino;
+            char perms[8];
+
+            if (sscanf(line, "%lx-%lx %7s %lx %*s %lu", &start, &end, perms,
+                       &off, &ino) != 5 || ino != oldst.st_ino ||
+                !strstr(line, "irix-mmem") || perms[3] != 'p') {
+                continue;
+            }
+            mmap((void *)start, end - start, PROT_READ,
+                 MAP_PRIVATE | MAP_FIXED, fd, off);
+        }
+        fclose(fp);
+    }
+    if (irix_mmem_page) {
+        munmap(irix_mmem_page, IRIX_CC_PAGE_SIZE);
+    }
+
+    /* inherited guest descriptors on the old page */
+    dir = opendir("/proc/self/fd");
+    if (dir) {
+        while ((de = readdir(dir)) && nfds < 64) {
+            struct stat st;
+            int n = atoi(de->d_name);
+
+            if (de->d_name[0] != '.' && n != dirfd(dir) && n != oldfd &&
+                n != fd && fstat(n, &st) == 0 && st.st_ino == oldst.st_ino &&
+                st.st_dev == oldst.st_dev) {
+                fds[nfds++] = n;
+            }
+        }
+        closedir(dir);
+    }
+    for (i = 0; i < nfds; i++) {
+        char name[40];
+        int cloexec = fcntl(fds[i], F_GETFD) & FD_CLOEXEC;
+
+        snprintf(name, sizeof(name), "/proc/self/fd/%d", fd);
+        dupfd = open(name, O_RDONLY | (cloexec ? O_CLOEXEC : 0));
+        if (dupfd >= 0) {
+            dup3(dupfd, fds[i], cloexec ? O_CLOEXEC : 0);
+            close(dupfd);
+        }
+    }
+    close(oldfd);
+    irix_mmem_fd = fd;
+    irix_mmem_page = page;
+    fstat(fd, &irix_mmem_st);
+}
+
 static int irix_open_mmem(int flags)
 {
     char name[40];
