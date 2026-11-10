@@ -354,6 +354,8 @@
 #define TARGET_NR_sysinfo_hwserial	7
 #define TARGET_NR_sysinfo_hwproducer	8
 #define TARGET_NR_sysinfo_processors	109
+#define TARGET_NR_sysinfo_hostid	105
+#define TARGET_NR_sysinfo_serial	111
 
 
 /* utssyssgi(obuf, ibuf, cmd) */

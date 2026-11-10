@@ -15399,7 +15399,13 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             strncpy(target_buf, "IP22", arg3-1);
             break;
         case TARGET_NR_sysinfo_hwserial:
+        case TARGET_NR_sysinfo_serial:
+            /* _MIPS_SI_SERIAL answers like SI_HW_SERIAL */
             snprintf(target_buf, arg3-1, "%12llx", 0x08006900000DULL);
+            break;
+        case TARGET_NR_sysinfo_hostid:
+            /* the gethostid value, as lowercase hex ("%lx" of a 32-bit ID) */
+            snprintf(target_buf, arg3-1, "%x", (uint32_t)irix_gethostid());
             break;
         case TARGET_NR_sysinfo_hwproducer:
             strncpy(target_buf, "Qemu", arg3-1);
