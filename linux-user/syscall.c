@@ -8164,6 +8164,7 @@ static int open_net_route(void *cpu_env, int fd)
 #define IRIX_CC_PAGE    (IRIX_CC_PADDR & ~0xfffu)
 #define IRIX_CC_PAGE_SIZE 0x4000u /* covers a 16 KB IRIX page too */
 #define IRIX_FASTTIMER_PERIOD_NS 1000000
+#define IRIX_NGROUPS_UMAX 32    /* sys/param.h */
 
 static int irix_cc_bits = 64;
 
@@ -15105,8 +15106,67 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
 	case TARGET_NR_syssgi_getprocattr: /* ? 2nd=string 3rd=result ptr */
 	    ret = 0;
 	    break;
-        case TARGET_NR_syssgi_setgroups:
         case TARGET_NR_syssgi_getgroups:
+            /*
+             * IRIX libc getgroups(n, list) is syssgi(SGI_GETGROUPS, n, list)
+             * and returns the same count as the POSIX call.  gid_t is a
+             * 32-bit value in both ABIs.
+             */
+            {
+                int count = getgroups(0, NULL);
+                gid_t *groups;
+                uint32_t *target_groups;
+                int i;
+
+                if (count < 0) {
+                    ret = get_errno(count);
+                } else if ((int)arg2 < 0 || ((int)arg2 > 0 && (int)arg2 < count)) {
+                    ret = -TARGET_EINVAL;
+                } else if (arg2 == 0) {
+                    ret = count;
+                } else {
+                    groups = g_new(gid_t, count + 1);
+                    ret = get_errno(getgroups(count, groups));
+                    if (!is_error(ret)) {
+                        target_groups = lock_user(VERIFY_WRITE, arg3,
+                                                  ret * sizeof(uint32_t), 0);
+                        if (ret && !target_groups) {
+                            g_free(groups);
+                            goto efault;
+                        }
+                        for (i = 0; i < ret; i++) {
+                            __put_user(groups[i], &target_groups[i]);
+                        }
+                        unlock_user(target_groups, arg3,
+                                    ret * sizeof(uint32_t));
+                    }
+                    g_free(groups);
+                }
+            }
+            break;
+        case TARGET_NR_syssgi_setgroups:
+            /* syssgi(SGI_SETGROUPS, n, list); sys/param.h caps a process at NGROUPS_UMAX (32) */
+            {
+                gid_t groups[IRIX_NGROUPS_UMAX];
+                uint32_t *target_groups;
+                int i;
+
+                if ((int)arg2 < 0 || (int)arg2 > IRIX_NGROUPS_UMAX) {
+                    ret = -TARGET_EINVAL;
+                    break;
+                }
+                target_groups = lock_user(VERIFY_READ, arg3,
+                                          arg2 * sizeof(uint32_t), 1);
+                if (arg2 && !target_groups) {
+                    goto efault;
+                }
+                for (i = 0; i < (int)arg2; i++) {
+                    __get_user(groups[i], &target_groups[i]);
+                }
+                unlock_user(target_groups, arg3, 0);
+                ret = get_errno(setgroups(arg2, groups));
+            }
+            break;
         default:
             gemu_log("qemu: Unsupported syscall: sgisys(%d)\n", (int)arg1);
             ret = -TARGET_ENOSYS;
