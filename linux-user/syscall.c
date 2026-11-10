@@ -3770,12 +3770,121 @@ static TargetFdTrans target_netlink_audit_trans = {
     .host_to_target_data = netlink_audit_host_to_target,
 };
 
+
+#ifdef TARGET_ABI_IRIX
+/*
+ * AF_RAW, IRIX's link-layer socket family (net/raw.h).  Only the identity
+ * queries are modelled: socket(AF_RAW, SOCK_RAW, proto) hands out a
+ * descriptor and bind() takes a struct sockaddr_raw, so a program that
+ * opens and binds a snoop or drain socket to learn its NIC's address gets
+ * that far.  Packets are not captured or sent, so every data path on such a
+ * descriptor fails with EOPNOTSUPP rather than blocking or pretending to
+ * work.  The descriptor is backed by an unconnected AF_UNIX datagram socket,
+ * which only exists so close, dup and fork behave like they do for any fd.
+ */
+#define TARGET_AF_RAW           18
+#define TARGET_RAWPROTO_RAW     0   /* wild-card, defaults to snoop */
+#define TARGET_RAWPROTO_DRAIN   1
+#define TARGET_RAWPROTO_SNOOP   2
+#define TARGET_IRIX_SIOCGIFADDR 0xc020690d  /* _IOWR('i', 13, struct ifreq) */
+#define TARGET_RAW_IFNAMSIZ     12  /* sizeof sa_data (14) - sizeof(u_short) */
+
+/* struct sockaddr_raw, local form: family, socket id, zero-padded if name */
+struct target_sockaddr_raw {
+    uint16_t sr_family;
+    uint16_t sr_port;
+    char sr_ifname[TARGET_RAW_IFNAMSIZ];
+};
+
+static abi_long irix_raw_addr(void *host_addr, abi_ulong target_addr,
+                              socklen_t len)
+{
+    struct target_sockaddr_raw *sr;
+
+    if (len < sizeof(*sr)) {
+        return -TARGET_EINVAL;
+    }
+    sr = lock_user(VERIFY_READ, target_addr, sizeof(*sr), 1);
+    if (!sr) {
+        return -TARGET_EFAULT;
+    }
+    if (tswap16(sr->sr_family) != TARGET_AF_RAW) {
+        unlock_user(sr, target_addr, 0);
+        return -TARGET_EAFNOSUPPORT;
+    }
+    if (!memchr(sr->sr_ifname, 0, sizeof(sr->sr_ifname))) {
+        /* the interface name has no room for its terminator */
+        unlock_user(sr, target_addr, 0);
+        return -TARGET_EINVAL;
+    }
+    memset(host_addr, 0, sizeof(*sr));
+    unlock_user(sr, target_addr, 0);
+    return 0;
+}
+
+static TargetFdTrans irix_raw_trans = {
+    .target_to_host_addr = irix_raw_addr,
+};
+
+static bool irix_raw_fd(int fd)
+{
+    return fd >= 0 && fd < target_fd_max &&
+           target_fd_trans[fd] == &irix_raw_trans;
+}
+
+/* data and connection calls on an AF_RAW descriptor: not implemented */
+static bool irix_raw_unsupported(int fd, const char *what)
+{
+    if (!irix_raw_fd(fd)) {
+        return false;
+    }
+    gemu_log("qemu: Unsupported syscall: %s on an AF_RAW socket "
+             "(only socket, bind and close are modelled)\n", what);
+    return true;
+}
+
+static abi_long irix_raw_socket(int type, int protocol)
+{
+    int fd;
+
+    if ((type & TARGET_SOCK_TYPE_MASK) != TARGET_SOCK_RAW) {
+        return -TARGET_EPROTOTYPE;
+    }
+    if (protocol < TARGET_RAWPROTO_RAW || protocol > TARGET_RAWPROTO_SNOOP) {
+        return -TARGET_EPROTONOSUPPORT;
+    }
+    fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return get_errno(fd);
+    }
+    if (!(type & TARGET_SOCK_CLOEXEC)) {
+        fcntl(fd, F_SETFD, 0);
+    }
+    fd = sock_flags_fixup(fd, type);
+    if (fd >= 0) {
+        fd_trans_register(fd, &irix_raw_trans);
+    }
+    return fd;
+}
+#else
+static inline bool irix_raw_fd(int fd) { return false; }
+static inline bool irix_raw_unsupported(int fd, const char *what)
+{
+    return false;
+}
+#endif
+
 /* do_socket() Must return target values and target errnos. */
 static abi_long do_socket(int domain, int type, int protocol)
 {
     int target_type = type;
     int ret;
 
+#ifdef TARGET_ABI_IRIX
+    if (domain == TARGET_AF_RAW) {
+        return irix_raw_socket(type, protocol);
+    }
+#endif
     ret = target_to_host_sock_type(&type);
     if (ret) {
         return ret;
@@ -3841,6 +3950,10 @@ static abi_long do_bind(int sockfd, abi_ulong target_addr,
     if (ret)
         return ret;
 
+    if (irix_raw_fd(sockfd)) {
+        /* nothing to bind: the address was only checked */
+        return 0;
+    }
     return get_errno(bind(sockfd, addr, addrlen));
 }
 
@@ -3850,6 +3963,10 @@ static abi_long do_connect(int sockfd, abi_ulong target_addr,
 {
     void *addr;
     abi_long ret;
+
+    if (irix_raw_unsupported(sockfd, "connect")) {
+        return -TARGET_EOPNOTSUPP;
+    }
 
     if ((int)addrlen < 0) {
         return -TARGET_EINVAL;
@@ -3974,6 +4091,10 @@ static abi_long do_sendrecvmsg(int fd, abi_ulong target_msg,
     abi_long ret;
     struct target_msghdr *msgp;
 
+    if (irix_raw_unsupported(fd, "sendmsg/recvmsg")) {
+        return -TARGET_EOPNOTSUPP;
+    }
+
     if (!lock_user_struct(send ? VERIFY_READ : VERIFY_WRITE,
                           msgp,
                           target_msg,
@@ -4043,6 +4164,10 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
     abi_long ret;
     int host_flags;
 
+    if (irix_raw_unsupported(fd, "accept")) {
+        return -TARGET_EOPNOTSUPP;
+    }
+
     host_flags = target_to_host_bitmask(flags, fcntl_flags_tbl);
 
     if (target_addr == 0) {
@@ -4079,6 +4204,10 @@ static abi_long do_getpeername(int fd, abi_ulong target_addr,
     void *addr;
     abi_long ret;
 
+    if (irix_raw_unsupported(fd, "getpeername")) {
+        return -TARGET_EOPNOTSUPP;
+    }
+
     if (get_user_u32(addrlen, target_addrlen_addr))
         return -TARGET_EFAULT;
 
@@ -4107,6 +4236,10 @@ static abi_long do_getsockname(int fd, abi_ulong target_addr,
     socklen_t addrlen;
     void *addr;
     abi_long ret;
+
+    if (irix_raw_unsupported(fd, "getsockname")) {
+        return -TARGET_EOPNOTSUPP;
+    }
 
     if (get_user_u32(addrlen, target_addrlen_addr))
         return -TARGET_EFAULT;
@@ -4158,6 +4291,10 @@ static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
     void *copy_msg = NULL;
     abi_long ret;
 
+    if (irix_raw_unsupported(fd, "send")) {
+        return -TARGET_EOPNOTSUPP;
+    }
+
     if ((int)addrlen < 0) {
         return -TARGET_EINVAL;
     }
@@ -4202,6 +4339,10 @@ static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
     void *addr;
     void *host_msg;
     abi_long ret;
+
+    if (irix_raw_unsupported(fd, "recv")) {
+        return -TARGET_EOPNOTSUPP;
+    }
 
     host_msg = lock_user(VERIFY_WRITE, msg, len, 0);
     if (!host_msg)
@@ -5823,6 +5964,15 @@ static abi_long do_ioctl(int fd, int cmd, abi_long arg)
     int target_size;
     void *argptr;
 
+#ifdef TARGET_ABI_IRIX
+    /*
+     * SIOCGIFADDR on an AF_RAW socket reads the NIC's Ethernet address.  The
+     * reply layout is not established yet, so refuse rather than guess.
+     */
+    if (cmd == TARGET_IRIX_SIOCGIFADDR && irix_raw_unsupported(fd, "SIOCGIFADDR")) {
+        return -TARGET_EOPNOTSUPP;
+    }
+#endif
     ie = ioctl_entries;
     for(;;) {
         if (ie->target_cmd == 0) {
@@ -8530,16 +8680,28 @@ static void irix_hostid_pick_host_nic(void)
     freeifaddrs(ifa);
 }
 
-static abi_long irix_gethostid(void)
+/* The configured or host-derived Ethernet address; false if there is none. */
+bool irix_hostid_get_mac(uint8_t mac[6])
 {
     if (!irix_hostid_have_mac) {
         irix_hostid_pick_host_nic();
     }
     if (!irix_hostid_have_mac) {
+        return false;
+    }
+    memcpy(mac, irix_hostid_mac, 6);
+    return true;
+}
+
+static abi_long irix_gethostid(void)
+{
+    uint8_t mac[6];
+
+    if (!irix_hostid_get_mac(mac)) {
         return (abi_long)(int32_t)gethostid();
     }
     /* low 32 bits of the address, bytes 2..5, big-endian, as a signed int */
-    return (abi_long)(int32_t)ldl_be_p(irix_hostid_mac + 2);
+    return (abi_long)(int32_t)ldl_be_p(mac + 2);
 }
 #endif
 
@@ -8590,7 +8752,9 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             ret = do_exit(cpu_env, arg1);
         break;
     case TARGET_NR_read:
-        if (arg3 == 0)
+        if (irix_raw_unsupported(arg1, "read")) {
+            ret = -TARGET_EOPNOTSUPP;
+        } else if (arg3 == 0)
             ret = 0;
         else {
             if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
@@ -8604,6 +8768,10 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
         }
         break;
     case TARGET_NR_write:
+        if (irix_raw_unsupported(arg1, "write")) {
+            ret = -TARGET_EOPNOTSUPP;
+            break;
+        }
         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
             goto efault;
         if (fd_trans_target_to_host_data(arg1)) {
@@ -10668,6 +10836,10 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_listen
     case TARGET_NR_listen:
+        if (irix_raw_unsupported(arg1, "listen")) {
+            ret = -TARGET_EOPNOTSUPP;
+            break;
+        }
         ret = get_errno(listen(arg1, arg2));
         break;
 #endif
@@ -11558,6 +11730,10 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
         break;
 #endif
     case TARGET_NR_readv:
+        if (irix_raw_unsupported(arg1, "readv")) {
+            ret = -TARGET_EOPNOTSUPP;
+            break;
+        }
         {
             struct iovec *vec = lock_iovec(VERIFY_WRITE, arg2, arg3, 0);
             if (vec != NULL) {
@@ -11569,6 +11745,10 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
         }
         break;
     case TARGET_NR_writev:
+        if (irix_raw_unsupported(arg1, "writev")) {
+            ret = -TARGET_EOPNOTSUPP;
+            break;
+        }
         {
             struct iovec *vec = lock_iovec(VERIFY_READ, arg2, arg3, 1);
             if (vec != NULL) {
