@@ -9239,7 +9239,12 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_chdir:
         if (!(p = lock_user_string(arg1)))
             goto efault;
-        ret = get_errno(chdir(p));
+        ret = get_errno(chdir(path(p)));
+#ifdef TARGET_ABI_IRIX
+        if (!is_error(ret)) {
+            path_chdir(p);
+        }
+#endif
         unlock_user(p, arg1, 0);
         break;
 #ifdef TARGET_NR_time
@@ -11518,6 +11523,11 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
 #endif
     case TARGET_NR_fchdir:
         ret = get_errno(fchdir(arg1));
+#ifdef TARGET_ABI_IRIX
+        if (!is_error(ret)) {
+            path_chdir_forget();
+        }
+#endif
         break;
 #ifdef TARGET_NR_bdflush /* not on x86_64 */
     case TARGET_NR_bdflush:

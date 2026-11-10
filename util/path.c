@@ -253,15 +253,114 @@ static const char *lookup_path(const char *name)
     return NULL;
 }
 
+/* The guest's working directory as the guest names it, once it has changed
+   directory by name.  The host resolves a relative name against the host
+   working directory, which is right for one sysroot but misses a file that
+   lives in the same directory of a later -L root, and lets ".." climb out of
+   the sysroot's top.  Only guests that call path_chdir() get the extra
+   lookup; for the rest relative names stay with the host. */
+static char *virt_cwd;
+
+/* Resolve "." , ".." and repeated slashes in the absolute NAME textually.
+   Symlinks are not followed.  Returns a new string. */
+static char *normalize_path(const char *name)
+{
+    char *out = g_malloc(strlen(name) + 2);
+    size_t len = 0;
+    const char *p = name;
+
+    while (*p) {
+        size_t n;
+
+        p += strspn(p, "/");
+        n = strcspn(p, "/");
+        if (n == 0) {
+            break;
+        }
+        if (n == 1 && p[0] == '.') {
+            /* stay */
+        } else if (n == 2 && p[0] == '.' && p[1] == '.') {
+            while (len > 0 && out[len - 1] != '/') {
+                len--;
+            }
+            if (len > 0) {
+                len--;              /* the slash before the dropped part */
+            }
+        } else {
+            out[len++] = '/';
+            memcpy(out + len, p, n);
+            len += n;
+        }
+        p += n;
+    }
+    if (len == 0) {
+        out[len++] = '/';
+    }
+    out[len] = '\0';
+    return out;
+}
+
+/* Note a successful chdir(NAME) of the guest; NAME is the guest's string. */
+void path_chdir(const char *name)
+{
+    char *abs;
+
+    if (!base || !name) {
+        return;
+    }
+    if (name[0] == '/') {
+        abs = g_strdup(name);
+    } else if (virt_cwd) {
+        abs = g_strdup_printf("%s/%s", virt_cwd, name);
+    } else {
+        /* relative to a directory we never learnt: stay with the host */
+        path_chdir_forget();
+        return;
+    }
+    g_free(virt_cwd);
+    virt_cwd = normalize_path(abs);
+    g_free(abs);
+}
+
+/* The working directory changed by some route that has no name (fchdir). */
+void path_chdir_forget(void)
+{
+    g_free(virt_cwd);
+    virt_cwd = NULL;
+}
+
+/* A relative NAME against the guest's working directory, or NULL when that
+   is not known. */
+static char *virt_absolute(const char *name)
+{
+    char *abs, *norm;
+
+    if (!virt_cwd) {
+        return NULL;
+    }
+    abs = g_strdup_printf("%s/%s", virt_cwd, name);
+    norm = normalize_path(abs);
+    g_free(abs);
+    return norm;
+}
+
 /* Look for path in emulation dir, otherwise return name. */
 const char *path(const char *name)
 {
     const char *p;
 
-    /* Only do absolute paths: quick and dirty, but should mostly be OK.
-       Could do relative by tracking cwd. */
-    if (!base || !name || name[0] != '/')
+    if (!base || !name) {
         return name;
+    }
+    if (name[0] != '/') {
+        /* Relative: the host handles it unless the guest has chdir'd, in
+           which case look it up under that directory in every root. */
+        char *abs = virt_absolute(name);
+
+        p = abs ? lookup_path(abs) : NULL;
+        g_free(abs);
+        return p ? p : name;
+    }
 
     p = lookup_path(name);
     return p ? p : name;
@@ -273,21 +372,27 @@ const char *path(const char *name)
 const char *path_create(const char *name)
 {
     char dir[PATH_MAX];
-    const char *p, *leaf, *pdir;
+    const char *p, *leaf, *pdir, *guest = name;
+    char *abs = NULL;
 
-    if (!base || !name || name[0] != '/')
+    if (!base || !name) {
         return name;
-
-    p = lookup_path(name);
-    if (p) {
-        return p;
     }
-    leaf = split_path(name, dir, sizeof(dir));
-    if (leaf && (pdir = lookup_path(dir))) {
-        p = join_path(pdir, leaf);
-        if (p) {
-            return p;
+    if (name[0] != '/') {
+        abs = virt_absolute(name);
+        if (!abs) {
+            return name;
+        }
+        guest = abs;
+    }
+
+    p = lookup_path(guest);
+    if (!p) {
+        leaf = split_path(guest, dir, sizeof(dir));
+        if (leaf && (pdir = lookup_path(dir))) {
+            p = join_path(pdir, leaf);
         }
     }
-    return name;
+    g_free(abs);
+    return p ? p : name;
 }
