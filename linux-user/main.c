@@ -2679,8 +2679,19 @@ done_syscall:   ;
             } else
 #  endif
             {
-                env->active_tc.gpr[7] = (ret >= (abi_ulong)-1700);
-                env->active_tc.gpr[2] = (env->active_tc.gpr[7] ? -ret : ret);
+                /*
+                 * gethostid cannot fail and any 32-bit value is a valid
+                 * host ID, including those that look like a negative errno.
+                 * Like the kernel, return it sign-extended in the 64-bit
+                 * register: an ID with bit 31 set reads as negative.
+                 */
+                if (syscall_num + TARGET_NR_Linux == TARGET_NR_gethostid) {
+                    env->active_tc.gpr[7] = 0;
+                    env->active_tc.gpr[2] = ret;
+                } else {
+                    env->active_tc.gpr[7] = (ret >= (abi_ulong)-1700);
+                    env->active_tc.gpr[2] = (env->active_tc.gpr[7] ? -ret : ret);
+                }
             }
 # else
             if ((abi_ulong)ret >= (abi_ulong)-1133) {
@@ -4476,6 +4487,20 @@ static void handle_arg_ld_prefix(const char *arg)
     interp_prefix = strdup(arg);
 }
 
+#ifdef TARGET_ABI_IRIX
+static void handle_arg_irixhostid(const char *arg)
+{
+    uint8_t mac[6];
+
+    if (!irix_hostid_parse(arg, mac)) {
+        fprintf(stderr, "qemu: invalid IRIX host ID '%s': expected exactly "
+                "12 hex digits, for example 00508ba54a65\n", arg);
+        exit(EXIT_FAILURE);
+    }
+    irix_hostid_set(mac);
+}
+#endif
+
 static void handle_arg_pagesize(const char *arg)
 {
     qemu_host_page_size = atoi(arg);
@@ -4604,6 +4629,10 @@ static const struct qemu_argument arg_table[] = {
      "size",       "set the stack size to 'size' bytes"},
     {"cpu",        "QEMU_CPU",         true,  handle_arg_cpu,
      "model",      "select CPU (-cpu help for list)"},
+#ifdef TARGET_ABI_IRIX
+    {"irixhostid", "QEMU_IRIXHOSTID",  true,  handle_arg_irixhostid,
+     "hex12",      "Ethernet address returned as the host ID (default: first host NIC)"},
+#endif
     {"E",          "QEMU_SET_ENV",     true,  handle_arg_set_env,
      "var=value",  "sets targets environment variable (see below)"},
     {"U",          "QEMU_UNSET_ENV",   true,  handle_arg_unset_env,

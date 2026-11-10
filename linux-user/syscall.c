@@ -109,6 +109,7 @@
 #include <linux/filter.h>
 #include <linux/blkpg.h>
 #include <netpacket/packet.h>
+#include <ifaddrs.h>
 #include <linux/netlink.h>
 #ifdef CONFIG_RTNETLINK
 #include <linux/rtnetlink.h>
@@ -8460,6 +8461,88 @@ static int host_to_target_cpu_mask(const unsigned long *host_mask,
 /* do_syscall() should always have a single exit point at the end so
    that actions, such as logging of syscall results, can be performed.
    All errnos that do_syscall() returns must be -TARGET_<errcode>. */
+#ifdef TARGET_ABI_IRIX
+/*
+ * IRIX host ID.  gethostid(2) returns the kernel's 32-bit, root-settable
+ * host ID variable, sign-extended in the result register of an N32 caller
+ * when bit 31 is set (the sysinfo string form is not); it is not the
+ * Ethernet address.  On real Octane-class
+ * machines that variable equals the last four bytes of the machine's
+ * 08:00:69 address (checked with lmhostid on 13 machine families), so the
+ * configured address feeds it, and only the low four
+ * bytes of the Ethernet address can come back through it.  The address is
+ * taken from QEMU_IRIXHOSTID / -irixhostid when given; otherwise from the
+ * host NIC with the lowest interface index that is not loopback and has a
+ * non-zero 6-byte hardware address.  Without such a NIC the host's own
+ * gethostid() is used.
+ */
+static uint8_t irix_hostid_mac[6];
+static bool irix_hostid_have_mac;
+
+bool irix_hostid_parse(const char *arg, uint8_t mac[6])
+{
+    int i;
+
+    if (strlen(arg) != 12) {
+        return false;
+    }
+    for (i = 0; i < 12; i++) {
+        if (!g_ascii_isxdigit(arg[i])) {
+            return false;
+        }
+    }
+    for (i = 0; i < 6; i++) {
+        mac[i] = (g_ascii_xdigit_value(arg[2 * i]) << 4) |
+                 g_ascii_xdigit_value(arg[2 * i + 1]);
+    }
+    return true;
+}
+
+void irix_hostid_set(const uint8_t mac[6])
+{
+    memcpy(irix_hostid_mac, mac, 6);
+    irix_hostid_have_mac = true;
+}
+
+static void irix_hostid_pick_host_nic(void)
+{
+    struct ifaddrs *ifa, *p;
+    unsigned best = UINT_MAX;
+
+    if (getifaddrs(&ifa) != 0) {
+        return;
+    }
+    for (p = ifa; p; p = p->ifa_next) {
+        struct sockaddr_ll *ll = (struct sockaddr_ll *)p->ifa_addr;
+        static const uint8_t zero[6];
+
+        if (!ll || ll->sll_family != AF_PACKET || ll->sll_halen != 6 ||
+            (p->ifa_flags & IFF_LOOPBACK) ||
+            !memcmp(ll->sll_addr, zero, 6)) {
+            continue;
+        }
+        if ((unsigned)ll->sll_ifindex < best) {
+            best = ll->sll_ifindex;
+            memcpy(irix_hostid_mac, ll->sll_addr, 6);
+            irix_hostid_have_mac = true;
+        }
+    }
+    freeifaddrs(ifa);
+}
+
+static abi_long irix_gethostid(void)
+{
+    if (!irix_hostid_have_mac) {
+        irix_hostid_pick_host_nic();
+    }
+    if (!irix_hostid_have_mac) {
+        return (abi_long)(int32_t)gethostid();
+    }
+    /* low 32 bits of the address, bytes 2..5, big-endian, as a signed int */
+    return (abi_long)(int32_t)ldl_be_p(irix_hostid_mac + 2);
+}
+#endif
+
 abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
                     abi_long arg2, abi_long arg3, abi_long arg4,
                     abi_long arg5, abi_long arg6, abi_long arg7,
@@ -13720,7 +13803,11 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_gethostid
     case TARGET_NR_gethostid:
+#ifdef TARGET_ABI_IRIX
+        ret = irix_gethostid();
+#else
         ret = get_errno(gethostid());
+#endif
         break;
     case TARGET_NR_sethostid:
         ret = get_errno(sethostid(arg1));
