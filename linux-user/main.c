@@ -4490,14 +4490,31 @@ static void handle_arg_ld_prefix(const char *arg)
 #ifdef TARGET_ABI_IRIX
 static void handle_arg_irixhostid(const char *arg)
 {
-    uint8_t mac[6];
-
-    if (!irix_hostid_parse(arg, mac)) {
+    if (!irix_identity_set_station(arg)) {
         fprintf(stderr, "qemu: invalid IRIX host ID '%s': expected exactly "
-                "12 hex digits, for example 00508ba54a65\n", arg);
+                "12 hex digits (a station address, for example "
+                "00508ba54a65), or 8 or 6 for its low four or three bytes\n",
+                arg);
         exit(EXIT_FAILURE);
     }
-    irix_hostid_set(mac);
+}
+
+static void handle_arg_irixmachine(const char *arg)
+{
+    if (!irix_identity_set_machine(arg)) {
+        fprintf(stderr, "qemu: invalid IRIX machine class '%s': expected "
+                "'address' or 'text'\n", arg);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void handle_arg_irixserial(const char *arg)
+{
+    if (!irix_identity_set_serial(arg)) {
+        fprintf(stderr, "qemu: invalid IRIX serial '%s': expected 1 to 63 "
+                "printable ASCII characters\n", arg);
+        exit(EXIT_FAILURE);
+    }
 }
 
 static void handle_arg_irixcyclebits(const char *arg)
@@ -4642,8 +4659,12 @@ static const struct qemu_argument arg_table[] = {
     {"cpu",        "QEMU_CPU",         true,  handle_arg_cpu,
      "model",      "select CPU (-cpu help for list)"},
 #ifdef TARGET_ABI_IRIX
+    {"irixmachine", "QEMU_IRIXMACHINE", true, handle_arg_irixmachine,
+     "class",      "machine class: address (default) or text"},
     {"irixhostid", "QEMU_IRIXHOSTID",  true,  handle_arg_irixhostid,
-     "hex12",      "Ethernet address returned as the host ID (default: first host NIC)"},
+     "hex",        "station address (12 hex digits; 8 or 6 for its low bytes) of an address machine (default: first host NIC)"},
+    {"irixserial", "QEMU_IRIXSERIAL",  true,  handle_arg_irixserial,
+     "text",       "serial string of a text machine, for example K0025190"},
     {"irixcyclebits", "QEMU_IRIXCYCLEBITS", true, handle_arg_irixcyclebits,
      "bits",       "width of the cycle counter: 24, 32 or 64 (default 64, as on Octane and Origin; boards with the O2 style memory controller, O2, Indy and Indigo2, use 32)"},
 #endif
@@ -4869,6 +4890,17 @@ int main(int argc, char **argv, char **envp)
     qemu_add_opts(&qemu_trace_opts);
 
     optind = parse_args(argc, argv);
+
+#ifdef TARGET_ABI_IRIX
+    {
+        char err[256];
+
+        if (!irix_identity_init(err, sizeof(err))) {
+            fprintf(stderr, "qemu: %s\n", err);
+            exit(EXIT_FAILURE);
+        }
+    }
+#endif
 
     if (!trace_init_backends()) {
         exit(1);

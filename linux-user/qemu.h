@@ -221,9 +221,11 @@ abi_ulong sgi_map_elf_image(int image_fd, struct elf32_phdr *phdr, int phnum);
 #endif
 
 #ifdef TARGET_ABI_IRIX
-/* QEMU_IRIXHOSTID / -irixhostid: 12 hex digits, one Ethernet address */
-bool irix_hostid_parse(const char *arg, uint8_t mac[6]);
-void irix_hostid_set(const uint8_t mac[6]);
+/* machine identity: QEMU_IRIXMACHINE, QEMU_IRIXHOSTID, QEMU_IRIXSERIAL */
+bool irix_identity_set_machine(const char *arg);
+bool irix_identity_set_station(const char *arg);
+bool irix_identity_set_serial(const char *arg);
+bool irix_identity_init(char *err, size_t errlen);
 bool irix_hostid_get_mac(uint8_t mac[6]);
 /* QEMU_IRIXCYCLEBITS / -irixcyclebits: 24, 32 or 64 (default) */
 bool irix_cycle_bits_parse(const char *arg, int *bits);

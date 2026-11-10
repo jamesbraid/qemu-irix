@@ -8878,58 +8878,154 @@ static int host_to_target_cpu_mask(const unsigned long *host_mask,
    All errnos that do_syscall() returns must be -TARGET_<errcode>. */
 #ifdef TARGET_ABI_IRIX
 /*
- * IRIX host ID.  gethostid(2) returns the kernel's 32-bit, root-settable
- * host ID variable, sign-extended in the result register of an N32 caller
- * when bit 31 is set (the sysinfo string form is not); it is not the
- * Ethernet address.  On real Octane-class
- * machines that variable equals the last four bytes of the machine's
- * 08:00:69 address (checked with lmhostid on 13 machine families), so the
- * configured address feeds it, and only the low four
- * bytes of the Ethernet address can come back through it.  The address is
- * taken from QEMU_IRIXHOSTID / -irixhostid when given; otherwise from the
- * host NIC with the lowest interface index that is not loopback and has a
- * non-zero 6-byte hardware address.  Without such a NIC the host's own
- * gethostid() is used.
+ * IRIX machine identity.  One configured value yields every identity a
+ * program can ask for, so they always agree.
+ *
+ * The 64-byte buffer returned by syssgi(SGI_SYSID) is built once.  It is
+ * left-justified and zero-padded, and its first bytes depend on the class of
+ * machine being emulated:
+ *
+ *  address  (Octane, O2, Indy, Indigo2, Fuel, Origin 200, ...): bytes 0-3
+ *           are the big-endian low four bytes of the station (Ethernet)
+ *           address.
+ *  text     (Origin 2000/Onyx2 module serials, L1 system serials, ...): the
+ *           ASCII serial string.
+ *
+ * Every other call is derived from that buffer.  The 32-bit system id is the
+ * first four bytes for the address class, and for the text class the
+ * serial folded a nibble at a time: id = (id << 4) | (ch & 0xf) over its
+ * first ten characters, keeping 32 bits.  Then:
+ *
+ *   gethostid                  the host ID variable, which starts as the id
+ *                              (sethostid changes it); like the kernel it is
+ *                              returned sign-extended to an N32 caller
+ *   sysinfo(_MIPS_SI_HOSTID)   the same variable, as zero-extended lowercase hex
+ *   sysinfo(SI_HW_SERIAL, _MIPS_SI_SERIAL)  the id in decimal
+ *   SGI_MODULE_INFO serial_str   "0800" and the id as eight uppercase hex
+ *                                digits for the address class, the serial
+ *                                itself for the text class
+ *   AF_RAW SIOCGIFADDR           the station address (address class only)
+ *
+ * The inputs are the class (QEMU_IRIXMACHINE / -irixmachine), the station
+ * address (QEMU_IRIXHOSTID / -irixhostid) or the serial (QEMU_IRIXSERIAL /
+ * -irixserial).  Without any of them the machine is an address-class one
+ * with the address of the host NIC that has the lowest interface index, is
+ * not loopback and has a non-zero 6-byte address, so the result is stable
+ * across runs; with no such NIC the address is 08:00:aa:bb:cc:dd.
  */
-static uint8_t irix_hostid_mac[6];
-static bool irix_hostid_have_mac;
+#define IRIX_SYSID_SIZE 64
+#define IRIX_SYSID_FOLD_CHARS 10   /* serial characters that enter the id */
 
-bool irix_hostid_parse(const char *arg, uint8_t mac[6])
+typedef enum { IRIX_MACHINE_UNSET, IRIX_MACHINE_ADDRESS,
+               IRIX_MACHINE_TEXT } IrixMachine;
+
+static struct {
+    IrixMachine cls;            /* the class asked for, UNSET if neither */
+    bool have_mac;
+    uint8_t mac[6];
+    bool have_serial;
+    char serial[IRIX_SYSID_SIZE];
+    uint8_t sysid[IRIX_SYSID_SIZE];
+    uint32_t id;
+    bool hostid_set;            /* sethostid() was called */
+    uint32_t hostid;
+} irix_ident;
+
+bool irix_identity_set_machine(const char *arg)
+{
+    if (!strcmp(arg, "address")) {
+        irix_ident.cls = IRIX_MACHINE_ADDRESS;
+    } else if (!strcmp(arg, "text")) {
+        irix_ident.cls = IRIX_MACHINE_TEXT;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool irix_hex_bytes(const char *arg, uint8_t *out, int n)
 {
     int i;
 
-    if (strlen(arg) != 12) {
-        return false;
-    }
-    for (i = 0; i < 12; i++) {
+    for (i = 0; i < 2 * n; i++) {
         if (!g_ascii_isxdigit(arg[i])) {
             return false;
         }
     }
-    for (i = 0; i < 6; i++) {
-        mac[i] = (g_ascii_xdigit_value(arg[2 * i]) << 4) |
+    for (i = 0; i < n; i++) {
+        out[i] = (g_ascii_xdigit_value(arg[2 * i]) << 4) |
                  g_ascii_xdigit_value(arg[2 * i + 1]);
     }
     return true;
 }
 
-void irix_hostid_set(const uint8_t mac[6])
+/*
+ * The station address: twelve hex digits for the whole address, eight for
+ * its low four bytes (the SGI prefix 08:00 is added) or six for its low
+ * three (08:00:69 is added).
+ */
+bool irix_identity_set_station(const char *arg)
 {
-    memcpy(irix_hostid_mac, mac, 6);
-    irix_hostid_have_mac = true;
+    uint8_t mac[6];
+
+    switch (strlen(arg)) {
+    case 12:
+        if (!irix_hex_bytes(arg, mac, 6)) {
+            return false;
+        }
+        break;
+    case 8:
+        mac[0] = 0x08;
+        mac[1] = 0x00;
+        if (!irix_hex_bytes(arg, mac + 2, 4)) {
+            return false;
+        }
+        break;
+    case 6:
+        mac[0] = 0x08;
+        mac[1] = 0x00;
+        mac[2] = 0x69;
+        if (!irix_hex_bytes(arg, mac + 3, 3)) {
+            return false;
+        }
+        break;
+    default:
+        return false;
+    }
+    memcpy(irix_ident.mac, mac, 6);
+    irix_ident.have_mac = true;
+    return true;
 }
 
-static void irix_hostid_pick_host_nic(void)
+/* Any printable ASCII serial that fits the buffer with its terminator. */
+bool irix_identity_set_serial(const char *arg)
+{
+    size_t i, n = strlen(arg);
+
+    if (n == 0 || n >= IRIX_SYSID_SIZE) {
+        return false;
+    }
+    for (i = 0; i < n; i++) {
+        if (arg[i] < 0x20 || arg[i] > 0x7e) {
+            return false;
+        }
+    }
+    memcpy(irix_ident.serial, arg, n + 1);
+    irix_ident.have_serial = true;
+    return true;
+}
+
+static void irix_identity_pick_host_nic(void)
 {
     struct ifaddrs *ifa, *p;
     unsigned best = UINT_MAX;
+    static const uint8_t zero[6];
 
     if (getifaddrs(&ifa) != 0) {
         return;
     }
     for (p = ifa; p; p = p->ifa_next) {
         struct sockaddr_ll *ll = (struct sockaddr_ll *)p->ifa_addr;
-        static const uint8_t zero[6];
 
         if (!ll || ll->sll_family != AF_PACKET || ll->sll_halen != 6 ||
             (p->ifa_flags & IFF_LOOPBACK) ||
@@ -8938,35 +9034,86 @@ static void irix_hostid_pick_host_nic(void)
         }
         if ((unsigned)ll->sll_ifindex < best) {
             best = ll->sll_ifindex;
-            memcpy(irix_hostid_mac, ll->sll_addr, 6);
-            irix_hostid_have_mac = true;
+            memcpy(irix_ident.mac, ll->sll_addr, 6);
+            irix_ident.have_mac = true;
         }
     }
     freeifaddrs(ifa);
 }
 
-/* The configured or host-derived Ethernet address; false if there is none. */
-bool irix_hostid_get_mac(uint8_t mac[6])
+/*
+ * Settle the identity and build the buffer.  Called once, after the options
+ * are parsed.  On failure fills ERR with a message and returns false.
+ */
+bool irix_identity_init(char *err, size_t errlen)
 {
-    if (!irix_hostid_have_mac) {
-        irix_hostid_pick_host_nic();
-    }
-    if (!irix_hostid_have_mac) {
+    static const uint8_t fallback[6] = { 0x08, 0x00, 0xaa, 0xbb, 0xcc, 0xdd };
+    size_t i;
+
+    if (irix_ident.have_mac && irix_ident.have_serial) {
+        snprintf(err, errlen, "the IRIX station address (QEMU_IRIXHOSTID) and "
+                 "serial (QEMU_IRIXSERIAL) cannot both be given");
         return false;
     }
-    memcpy(mac, irix_hostid_mac, 6);
+    if (irix_ident.cls == IRIX_MACHINE_UNSET) {
+        irix_ident.cls = irix_ident.have_serial ? IRIX_MACHINE_TEXT
+                                                : IRIX_MACHINE_ADDRESS;
+    }
+    if (irix_ident.cls == IRIX_MACHINE_TEXT && !irix_ident.have_serial) {
+        snprintf(err, errlen, "an IRIX machine of class 'text' needs a serial "
+                 "(QEMU_IRIXSERIAL / -irixserial)");
+        return false;
+    }
+    if (irix_ident.cls == IRIX_MACHINE_ADDRESS && irix_ident.have_serial) {
+        snprintf(err, errlen, "an IRIX machine of class 'address' takes a "
+                 "station address (QEMU_IRIXHOSTID), not a serial");
+        return false;
+    }
+
+    memset(irix_ident.sysid, 0, sizeof(irix_ident.sysid));
+    if (irix_ident.cls == IRIX_MACHINE_ADDRESS) {
+        if (!irix_ident.have_mac) {
+            irix_identity_pick_host_nic();
+        }
+        if (!irix_ident.have_mac) {
+            memcpy(irix_ident.mac, fallback, 6);
+            irix_ident.have_mac = true;
+        }
+        memcpy(irix_ident.sysid, irix_ident.mac + 2, 4);
+        irix_ident.id = ldl_be_p(irix_ident.sysid);
+    } else {
+        uint32_t id = 0;
+
+        memcpy(irix_ident.sysid, irix_ident.serial,
+               strlen(irix_ident.serial));
+        for (i = 0; i < IRIX_SYSID_FOLD_CHARS && irix_ident.sysid[i]; i++) {
+            id = (id << 4) | (irix_ident.sysid[i] & 0xf);
+        }
+        irix_ident.id = id;
+    }
     return true;
 }
 
+/* The station address, for the address class; false for the text class. */
+bool irix_hostid_get_mac(uint8_t mac[6])
+{
+    if (irix_ident.cls != IRIX_MACHINE_ADDRESS) {
+        return false;
+    }
+    memcpy(mac, irix_ident.mac, 6);
+    return true;
+}
+
+/* The kernel host ID variable: the system id until sethostid changes it. */
+static uint32_t irix_hostid_value(void)
+{
+    return irix_ident.hostid_set ? irix_ident.hostid : irix_ident.id;
+}
+
+/* gethostid: the 32-bit value; the result register is sign-extended. */
 static abi_long irix_gethostid(void)
 {
-    uint8_t mac[6];
-
-    if (!irix_hostid_get_mac(mac)) {
-        return (abi_long)(int32_t)gethostid();
-    }
-    /* low 32 bits of the address, bytes 2..5, big-endian, as a signed int */
-    return (abi_long)(int32_t)ldl_be_p(mac + 2);
+    return (abi_long)(int32_t)irix_hostid_value();
 }
 #endif
 
@@ -14268,7 +14415,18 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
 #endif
         break;
     case TARGET_NR_sethostid:
+#ifdef TARGET_ABI_IRIX
+        /* only the emulated variable changes, never the host's */
+        if (geteuid() != 0) {
+            ret = -TARGET_EPERM;
+        } else {
+            irix_ident.hostid = (uint32_t)arg1;
+            irix_ident.hostid_set = true;
+            ret = 0;
+        }
+#else
         ret = get_errno(sethostid(arg1));
+#endif
         break;
 #endif
 /* SVR4 specific system calls */
@@ -15320,13 +15478,14 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
              * syssgi(SGI_MODULE_INFO, module, module_info_t *, size): only
              * module 0 exists.  Fills { u64 serial_num; int mod_num;
              * char serial_str[16]; } and copies out min(sizeof, size) bytes.
-             * The serial is the 32-bit one behind SI_HW_SERIAL (the low
-             * four bytes of the fixed 0x08006900000d), so the two agree;
-             * serial_str is "0800" and the serial as eight uppercase hex digits.
+             * serial_num is the 32-bit system id, the same number
+             * SI_HW_SERIAL prints.  serial_str is "0800" and the id as
+             * eight uppercase hex digits (the station address) for the
+             * address class, and the serial string for the text class.
              */
             {
                 uint8_t mi[IRIX_MODULE_INFO_SIZE] = { 0 };
-                uint32_t serial = 0x6900000dU;
+                uint32_t serial = irix_ident.id;
                 abi_ulong n = arg4 < sizeof(mi) ? arg4 : sizeof(mi);
                 void *dst;
 
@@ -15336,7 +15495,11 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
                 }
                 stq_be_p(mi, serial);
                 stl_be_p(mi + 8, 0);
-                snprintf((char *)mi + 12, 16, "0800%08X", serial);
+                if (irix_ident.cls == IRIX_MACHINE_ADDRESS) {
+                    snprintf((char *)mi + 12, 16, "0800%08X", serial);
+                } else {
+                    snprintf((char *)mi + 12, 16, "%s", irix_ident.serial);
+                }
                 dst = lock_user(VERIFY_WRITE, arg3, n, 0);
                 if (n && !dst) {
                     goto efault;
@@ -15351,13 +15514,13 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             break;
 	case TARGET_NR_syssgi_sysid:
         {
-            char * buf = lock_user(VERIFY_WRITE, arg2, 64, 0);
+            char * buf = lock_user(VERIFY_WRITE, arg2, IRIX_SYSID_SIZE, 0);
             if (!buf) {
                 goto efault;
             }
-            snprintf(buf, 64, "%12llx", 0x08006900000DULL);
+            memcpy(buf, irix_ident.sysid, IRIX_SYSID_SIZE);
             ret = 0;
-            unlock_user(buf, arg2, 64);
+            unlock_user(buf, arg2, IRIX_SYSID_SIZE);
             break;
         }
 	case TARGET_NR_syssgi_rldenv:
@@ -15537,12 +15700,12 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             break;
         case TARGET_NR_sysinfo_hwserial:
         case TARGET_NR_sysinfo_serial:
-            /* _MIPS_SI_SERIAL answers like SI_HW_SERIAL */
-            snprintf(target_buf, arg3-1, "%12llx", 0x08006900000DULL);
+            /* _MIPS_SI_SERIAL answers like SI_HW_SERIAL: the id in decimal */
+            snprintf(target_buf, arg3-1, "%u", irix_ident.id);
             break;
         case TARGET_NR_sysinfo_hostid:
             /* the gethostid value, as lowercase hex ("%lx" of a 32-bit ID) */
-            snprintf(target_buf, arg3-1, "%x", (uint32_t)irix_gethostid());
+            snprintf(target_buf, arg3-1, "%x", irix_hostid_value());
             break;
         case TARGET_NR_sysinfo_hwproducer:
             strncpy(target_buf, "Qemu", arg3-1);
