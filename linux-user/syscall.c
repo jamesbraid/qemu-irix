@@ -8137,24 +8137,59 @@ static int open_net_route(void *cpu_env, int fd)
 /*
  * The SGI free-running cycle counter, as reported by syssgi(2)
  * SGI_QUERY_CYCLECNTR and SGI_CYCLECNTR_SIZE.  SGI's machines differ in
- * counter width (24, 32 or 64 bits); the emulation provides the 64-bit
- * layout documented for the Challenge/Onyx family: the high word at the
- * returned address and the low word at address+4, read through a mapping
- * of /dev/mmem.  The address SGI_QUERY_CYCLECNTR returns is the one IRIX 6.5
+ * counter width (24, 32 or 64 bits) and the emulation provides all three,
+ * chosen with QEMU_IRIXCYCLEBITS / -irixcyclebits (default 64, what Octane
+ * and Origin report; 32 matches the boards with the O2 style memory
+ * controller, which includes Indy and Indigo2 as well as O2).
+ *
+ * The 64-bit layout is the one documented for the Challenge/Onyx family: the
+ * high word at the returned address and the low word at address+4, read
+ * through a mapping of /dev/mmem.  The 32-bit and 24-bit counters are a
+ * single 32-bit word at the returned address, the 24-bit one with the top
+ * byte zero.  The address SGI_QUERY_CYCLECNTR returns is the one IRIX 6.5
  * returns: RTC_MMAP_ADDR (0xaddac000, sys/mman.h) ORed with the counter's
  * offset in its page.  It is a cookie, not a hardware address: the program
  * rounds it down to a page and passes that as the mmap offset on /dev/mmem.
  * The offset is deliberately not page aligned, since callers must cope with
  * that.
- * The counter runs in nanoseconds of the host's CLOCK_MONOTONIC, so the
- * period reported to the guest is 1000 picoseconds per tick.
+ *
+ * The counter runs off the host's CLOCK_MONOTONIC.  The 64-bit and 32-bit
+ * ones tick in nanoseconds (1000 picoseconds per tick); the 24-bit one ticks
+ * in microseconds (1000000 picoseconds), since at 1 ns it would wrap every
+ * 16 ms.  All three tick rates and the counter's epoch are choices made
+ * here, not those of any SGI machine.
  */
-#define IRIX_CC_BITS    64
-#define IRIX_CC_PERIOD_PS 1000
 #define IRIX_RTC_MMAP_ADDR 0xaddac000u   /* sys/mman.h RTC_MMAP_ADDR */
 #define IRIX_CC_PADDR   (IRIX_RTC_MMAP_ADDR | 0xf8u)
 #define IRIX_CC_PAGE    (IRIX_CC_PADDR & ~0xfffu)
 #define IRIX_CC_PAGE_SIZE 0x4000u /* covers a 16 KB IRIX page too */
+#define IRIX_FASTTIMER_PERIOD_NS 1000000
+
+static int irix_cc_bits = 64;
+
+bool irix_cycle_bits_parse(const char *arg, int *bits)
+{
+    if (!strcmp(arg, "24")) {
+        *bits = 24;
+    } else if (!strcmp(arg, "32")) {
+        *bits = 32;
+    } else if (!strcmp(arg, "64")) {
+        *bits = 64;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+void irix_cycle_bits_set(int bits)
+{
+    irix_cc_bits = bits;
+}
+
+static uint32_t irix_cc_period_ps(void)
+{
+    return irix_cc_bits == 24 ? 1000000 : 1000;
+}
 
 /*
  * /dev/mmem is a window on physical memory.  The only physical address the
@@ -8175,9 +8210,27 @@ static pthread_mutex_t irix_mmem_lock = PTHREAD_MUTEX_INITIALIZER;
 static int irix_mmem_fd = -1;
 static struct stat irix_mmem_st;
 
+/* Store the current counter value in the page, in the configured width. */
+static void irix_cc_update(void *word)
+{
+    struct timespec ts;
+    uint64_t ns;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    if (irix_cc_bits == 64) {
+        /* one 64-bit store, so the guest's two 32-bit loads see one value */
+        atomic_set((uint64_t *)word, tswap64(ns));
+    } else if (irix_cc_bits == 32) {
+        atomic_set((uint32_t *)word, tswap32((uint32_t)ns));
+    } else {
+        atomic_set((uint32_t *)word,
+                   tswap32((uint32_t)(ns / 1000) & 0xffffff));
+    }
+}
+
 static void *irix_cc_thread(void *opaque)
 {
-    uint64_t *word = opaque;
     sigset_t all;
 
     /* guest signals must never be delivered here */
@@ -8188,10 +8241,7 @@ static void *irix_cc_thread(void *opaque)
     for (;;) {
         struct timespec ts;
 
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        /* one 64-bit store, so the guest's two 32-bit loads see one value */
-        atomic_set(word, tswap64((uint64_t)ts.tv_sec * 1000000000ull +
-                                 ts.tv_nsec));
+        irix_cc_update(opaque);
         ts.tv_sec = 0;
         ts.tv_nsec = 1000;
         nanosleep(&ts, NULL);
@@ -8230,6 +8280,8 @@ static int irix_mmem_init(void)
         close(fd);
         fd = hi;
     }
+    /* a guest that reads right after mapping must not see a zero counter */
+    irix_cc_update((char *)page + (IRIX_CC_PADDR & 0xfff));
     if (pthread_create(&thr, NULL, irix_cc_thread,
                        (char *)page + (IRIX_CC_PADDR & 0xfff)) != 0) {
         close(fd);
@@ -15011,13 +15063,30 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             break;
         case TARGET_NR_syssgi_query_cyclecntr:
             /* arg2: unsigned int, receives the period in ps per tick */
-            if (put_user_u32(IRIX_CC_PERIOD_PS, arg2)) {
+            if (put_user_u32(irix_cc_period_ps(), arg2)) {
                 goto efault;
             }
             ret = IRIX_CC_PADDR;
             break;
+        case TARGET_NR_syssgi_query_ftimer:
+            /*
+             * Whether fast itimers are enabled: they are not.  syssgi(2)
+             * callers treat zero as "off" (the quoted idiom is
+             * ftimerwasoff = !syssgi(SGI_QUERY_FTIMER)).
+             */
+            ret = 0;
+            break;
+        case TARGET_NR_syssgi_query_fasttimer:
+            /*
+             * Period of the fast itimers in nanoseconds, returned directly
+             * (IRIX libc clock_getres stores it as tv_nsec).  Octane computes
+             * NSEC_PER_SEC / fasthz and other boards return a constant of
+             * their own; assume the stock 1000 Hz fast clock.
+             */
+            ret = IRIX_FASTTIMER_PERIOD_NS;
+            break;
         case TARGET_NR_syssgi_cyclecntr_size:
-            ret = IRIX_CC_BITS;
+            ret = irix_cc_bits;
             break;
 	case TARGET_NR_syssgi_sysid:
         {

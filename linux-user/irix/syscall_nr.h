@@ -257,6 +257,7 @@
 #define TARGET_NR_syssgi_getsid		(65)
 /* SGI specific syssgi calls */
 #define TARGET_NR_syssgi_sysid		(1)
+#define TARGET_NR_syssgi_query_ftimer	(12)
 #define TARGET_NR_syssgi_query_cyclecntr (13)
 #define TARGET_NR_syssgi_elfmap		(68)
 #define TARGET_NR_syssgi_getprocattr    (85)
@@ -266,6 +267,7 @@
 #define TARGET_NR_syssgi_fpbcopy	(129)
 #define TARGET_NR_syssgi_getust		(130)
 #define TARGET_NR_syssgi_cyclecntr_size	(165)
+#define TARGET_NR_syssgi_query_fasttimer (166)
 
 
 /* syssgi(sysconf, cmd, ...) */

@@ -225,6 +225,9 @@ abi_ulong sgi_map_elf_image(int image_fd, struct elf32_phdr *phdr, int phnum);
 bool irix_hostid_parse(const char *arg, uint8_t mac[6]);
 void irix_hostid_set(const uint8_t mac[6]);
 bool irix_hostid_get_mac(uint8_t mac[6]);
+/* QEMU_IRIXCYCLEBITS / -irixcyclebits: 24, 32 or 64 (default) */
+bool irix_cycle_bits_parse(const char *arg, int *bits);
+void irix_cycle_bits_set(int bits);
 #endif
 
 abi_long memcpy_to_target(abi_ulong dest, const void *src,

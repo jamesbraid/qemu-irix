@@ -4499,6 +4499,18 @@ static void handle_arg_irixhostid(const char *arg)
     }
     irix_hostid_set(mac);
 }
+
+static void handle_arg_irixcyclebits(const char *arg)
+{
+    int bits;
+
+    if (!irix_cycle_bits_parse(arg, &bits)) {
+        fprintf(stderr, "qemu: invalid IRIX cycle counter width '%s': "
+                "expected 24, 32 or 64\n", arg);
+        exit(EXIT_FAILURE);
+    }
+    irix_cycle_bits_set(bits);
+}
 #endif
 
 static void handle_arg_pagesize(const char *arg)
@@ -4632,6 +4644,8 @@ static const struct qemu_argument arg_table[] = {
 #ifdef TARGET_ABI_IRIX
     {"irixhostid", "QEMU_IRIXHOSTID",  true,  handle_arg_irixhostid,
      "hex12",      "Ethernet address returned as the host ID (default: first host NIC)"},
+    {"irixcyclebits", "QEMU_IRIXCYCLEBITS", true, handle_arg_irixcyclebits,
+     "bits",       "width of the cycle counter: 24, 32 or 64 (default 64, as on Octane and Origin; boards with the O2 style memory controller, O2, Indy and Indigo2, use 32)"},
 #endif
     {"E",          "QEMU_SET_ENV",     true,  handle_arg_set_env,
      "var=value",  "sets targets environment variable (see below)"},
